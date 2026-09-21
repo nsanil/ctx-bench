@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the parts that read a CSV and decide what it means.
 
-    python3 test_ctxbench.py
+    python3 tests/test_ctxbench.py
 
 No server, no network, no fixtures beyond hand-written rows. The measurement
 code needs a GPU and a model; the code that turns measurements into a verdict
@@ -18,7 +18,12 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 
-import ctxbench
+# ctxbench.py is one level up, and both `python3 tests/test_ctxbench.py` and a
+# bare `pytest` leave the repo root off sys.path. Inserting it here covers them
+# without a package marker or a conftest.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import ctxbench  # noqa: E402
 
 
 def row(label="a", tps=60.0, depth=0, suite="code", effort="off",

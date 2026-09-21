@@ -1,0 +1,25 @@
+name: Test
+
+# The README claims Python 3.8+. This is what checks that claim rather than
+# asserting it: the suite runs on every version in the range, on every push.
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # No install step: the tool and its tests are standard library only, and
+      # a dependency appearing here would be the first sign that stopped being
+      # true.
+      - run: python tests/test_ctxbench.py

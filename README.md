@@ -217,6 +217,18 @@ this one.
 So: `llama-bench` for what the hardware and the build can do, this for what
 your running server does on the traffic you actually send it.
 
+## Tests
+
+```bash
+python3 tests/test_ctxbench.py
+```
+
+They cover the part that turns measurements into a verdict — the noise floor,
+the aggregation, and the handling of anything the server sent — none of which
+needs a GPU. The measurement path itself is not covered, because testing it
+requires the hardware being measured. CI runs the suite on Python 3.8 through
+3.13 on every push.
+
 ## Limitations
 
 Measures one llama.cpp server over HTTP. It manages no servers, downloads no
