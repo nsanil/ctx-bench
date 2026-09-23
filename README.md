@@ -8,6 +8,10 @@ GPU telemetry.
 
 Python 3.8+, standard library only. No dependencies, one file.
 
+Built for the experiments in [Your Empty-Context Benchmark Is Not Your Real
+Throughput](https://responsible-ai.blog/blog/qwen38-27b-context-depth/), which
+explains why each of these is worth controlling.
+
 ## Quick start
 
 You need a llama.cpp server already running. The tool does not start or
@@ -31,7 +35,7 @@ rather than the defaults, to keep the example short:
 
 ```text
 === mine ===
-      depth     tok/s     sd   accept  vs depth 0
+      depth     tok/s     sd   accept          vs 0
           0     62.88   0.20    68.9%        0.0%
      16,384     63.61   1.65    77.0%        1.2%
      65,536     52.75   0.72    75.1%      -16.1%
@@ -47,6 +51,20 @@ column is there for.
 **Your server's context must exceed your deepest `--depths` value.** The default
 ladder reaches 110,592 tokens, so a server started on a smaller context will
 not be able to run the deeper rows as requested.
+
+## Sampling
+
+Requests go out greedy — `temperature 0` — so repeats are comparable. That is a
+deliberate default, not a neutral one: if you are reproducing what an
+application actually sends, or a model publishes different presets for thinking
+and non-thinking modes, set them:
+
+```bash
+./ctxbench.py depth --temperature 1.0 --top-p 0.95 --top-k 20
+```
+
+`--temperature`, `--top-p`, `--top-k` and `--presence-penalty` are accepted on
+`depth`, `grid` and `ab`, and whatever you send is recorded in the run manifest.
 
 ## Commands
 
@@ -156,8 +174,10 @@ rotates its vocabulary.
 drafter. On speculative-decoding runs it often explains a large share of any
 throughput difference, so it is worth checking first when tok/s moves.
 
-`finished` counts replies that produced an answer. A row can report a healthy
-tok/s having generated nothing but reasoning.
+`answered` counts replies that produced any answer text at all. A row can
+report a healthy tok/s having generated nothing but reasoning, which is the
+case that column exists to make visible. It does not mean the reply ran to a
+natural stop — `finish` in the CSV says that.
 
 ## Failure behavior
 
@@ -173,7 +193,9 @@ Rows already written stay in the CSV, and the message says which case it was.
 
 ## Output
 
-One CSV, one row per request. Columns cover the request (`suite`, `effort`,
+One CSV, one row per request. Every row carries the harness `version` and the
+`run_id` of the run that produced it. Columns cover the request (`suite`,
+`effort`,
 `depth_target`, `max_tokens`), what the server reported (`decode_tps`,
 `prefill_tps`, `prompt_n`, `cache_n`, draft counters), what came back
 (`reason_chars`, `content_chars`, `answered`, `finish`), and host telemetry.
@@ -228,6 +250,42 @@ the aggregation, and the handling of anything the server sent — none of which
 needs a GPU. The measurement path itself is not covered, because testing it
 requires the hardware being measured. CI runs the suite on Python 3.8 through
 3.13 on every push.
+
+## What a run records about itself
+
+Every run writes a manifest beside the CSV, named for the run:
+
+```text
+results.20260922T205914-2c71.manifest.json
+```
+
+Each CSV row carries the matching `run_id`, so a row can always be traced to
+the configuration that produced it. That matters for the documented
+compare-two-arms workflow, where both arms share one CSV and were measured
+against different server settings.
+
+```json
+{
+  "ctxbench_version": "0.1.0",
+  "run_id": "20260922T205914-2c71",
+  "command": "depth", "label": "n4",
+  "model": "your-model-alias",
+  "sampling": { "temperature": 0.0 },
+  "server_model_file": "Qwen3.8-27B-IQ4_NL.gguf",
+  "server_build_info": "b1-9731ad3",
+  "server_chat_template_sha256": "12827f24b742ea4e",
+  "gpus": ["NVIDIA GeForce RTX 3090, 610.88, 24576 MiB"]
+}
+```
+
+The chat template is hashed rather than stored: it decides what
+`reasoning_effort` means, so two runs against nominally the same model but
+different templates are not comparable, and the hash says so in sixteen
+characters. The model path is reduced to its filename, since a manifest is
+meant to be shared.
+
+`./ctxbench.py --version` prints the harness version, which is also a column in
+every row.
 
 ## Limitations
 

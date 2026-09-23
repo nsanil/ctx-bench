@@ -40,10 +40,14 @@ class Agg(unittest.TestCase):
         self.assertIsNone(ctxbench.agg([row()])["sd"])
 
     def test_sd_is_a_number_once_replicated(self):
+        # Sample standard deviation, not population: repeats are a sample of
+        # run-to-run variation. pstdev would give 1.0 here and runs about 13%
+        # smaller at four repeats, which would make the noise floor less
+        # conservative than the README claims it is.
         g = ctxbench.agg([row(tps=60.0), row(tps=62.0)])
         self.assertEqual(g["n"], 2)
         self.assertAlmostEqual(g["tps"], 61.0)
-        self.assertAlmostEqual(g["sd"], 1.0)
+        self.assertAlmostEqual(g["sd"], 2 ** 0.5)
 
     def test_acceptance_absent_when_there_is_no_drafter(self):
         # A server without speculative decoding reports no draft counters at
@@ -222,7 +226,120 @@ class UntrustedServerOutput(unittest.TestCase):
         self.assertEqual(ctxbench.printable("a\nb\tc"), "a\nb\tc")
 
 
+class SharedArtifact(unittest.TestCase):
+    """The manifest is written to be sent to other people."""
+
+    def test_a_windows_server_path_is_reduced_on_a_posix_client(self):
+        # os.path binds to posixpath here and does not split on backslashes, so
+        # a Windows server's model_path -- account name and all -- would pass
+        # through untouched.
+        import ntpath
+        win = "C:" + chr(92) + "Users" + chr(92) + "someone" + chr(92) + "Q.gguf"
+        self.assertEqual(ntpath.basename(win), "Q.gguf")
+        self.assertEqual(ntpath.basename("/home/u/models/Q.gguf"), "Q.gguf")
+
+    def test_credentials_in_the_url_never_reach_the_manifest(self):
+        out = ctxbench.safe_url("http://user:secrettoken@gpu.internal:8080")
+        self.assertNotIn("secrettoken", out)
+        self.assertNotIn("user", out)
+        self.assertNotIn("gpu.internal", out)
+
+    def test_a_private_hostname_is_not_recorded(self):
+        self.assertEqual(
+            ctxbench.safe_url("http://workstation.tail1234.ts.net:8080"),
+            "http://<host>:8080")
+
+    def test_loopback_is_kept_because_it_identifies_nobody(self):
+        self.assertEqual(ctxbench.safe_url("http://127.0.0.1:8080"),
+                         "http://127.0.0.1:8080")
+        self.assertEqual(ctxbench.safe_url("http://[::1]:8080"),
+                         "http://[::1]:8080")
+
+    def test_a_junk_port_does_not_abort_the_run(self):
+        # urlsplit accepts these and only raises when .port is read, and this
+        # runs before the first request, so an escape here kills the run.
+        for url in ("http://h:99999", "http://h:abc", "http://h:-1",
+                    "", "http://", "not a url at all"):
+            self.assertIsInstance(ctxbench.safe_url(url), str)
+        self.assertEqual(ctxbench.safe_url("http://h:99999"), "unparseable")
+
+
+class Telemetry(unittest.TestCase):
+    """nvidia-smi prints one row per GPU, and the caller unpacks exactly five."""
+
+    def _gpu_with(self, stdout):
+        import unittest.mock as mock
+
+        class R:
+            def __init__(self, o):
+                self.stdout = o
+
+        with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+             mock.patch("subprocess.run", return_value=R(stdout)):
+            return ctxbench.gpu()
+
+    def test_a_second_gpu_does_not_crash_the_run(self):
+        # A multi-GPU host emits one row per card. Splitting all of stdout
+        # on commas would hand the caller ten fields for a five-value unpack,
+        # and that raises outside gpu()'s own except.
+        got = self._gpu_with("250.1, 65, 1800, 92, 23000\n"
+                             "180.0, 55, 1600, 40, 8000\n")
+        self.assertEqual(len(got), 5)
+        self.assertEqual(got, [""] * 5)
+
+    def test_one_gpu_is_read_normally(self):
+        got = self._gpu_with("250.1, 65, 1800, 92, 23000\n")
+        self.assertEqual(got, ["250.1", "65", "1800", "92", "23000"])
+
+    def test_no_output_or_junk_still_yields_five_fields(self):
+        for out in ("", "\n", "oops\n", "1, 2, 3\n"):
+            self.assertEqual(len(self._gpu_with(out)), 5)
+
+    def test_an_nvidia_smi_in_the_working_directory_is_refused_once(self):
+        import unittest.mock as mock
+        planted = os.path.join(os.getcwd(), "nvidia-smi")
+        with mock.patch("shutil.which", return_value=planted):
+            self.assertIsNone(ctxbench.safe_nvidia_smi())
+
+
+class MixedLabels(unittest.TestCase):
+    def test_a_label_holding_two_experiments_refuses_a_depth_table(self):
+        # Averaging a 200-token code run with an 8,000-token prose one under
+        # one label is the silent apples-to-oranges this tool exists to avoid.
+        rows = [row(depth=0, suite="code", max_tokens=200),
+                row(depth=8192, suite="prose", max_tokens=8000)]
+        buf = io.StringIO()
+        orig, ctxbench.load = ctxbench.load, lambda _p: rows
+        try:
+            with redirect_stdout(buf):
+                ctxbench.cmd_report(type("A", (), {"csv": None, "label": None})())
+        finally:
+            ctxbench.load = orig
+        out = buf.getvalue()
+        self.assertIn("more than one kind of run", out)
+        self.assertNotIn("vs ", out)
+
+
 class Writer(unittest.TestCase):
+    def test_a_file_with_a_foreign_header_is_not_appended_to(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "old.csv")
+        with open(path, "w") as fh:
+            fh.write("ts,label,something_else\n1,a,2\n")
+        with self.assertRaises(ctxbench.BenchError) as e:
+            ctxbench.Writer(path)
+        self.assertIn("different column set", str(e.exception))
+
+    def test_an_empty_file_gets_a_header(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "empty.csv")
+        open(path, "w").close()          # zero bytes, but it exists
+        w = ctxbench.Writer(path)
+        self.addCleanup(w.fh.close)
+        w.close()
+        with open(path) as fh:
+            self.assertEqual(fh.readline().strip().split(","), ctxbench.COLUMNS)
+
     def test_a_field_missing_from_COLUMNS_fails_at_write_time(self):
         import tempfile, os
         path = os.path.join(tempfile.mkdtemp(), "r.csv")

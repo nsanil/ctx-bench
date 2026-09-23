@@ -19,17 +19,21 @@ Three design choices worth knowing about before trusting any number it prints:
 Depth order rotates every pass. A ladder that always ascends measures its
 deepest point when the card is hottest, then reports heat as depth.
 
-Decode work is held constant within a run, so tok/s is comparable across
-depths. The only thing changing between rows is how much context is resident.
+The server configuration, the requested output cap, the prompt and the
+filler-generation procedure are held constant; context depth is the controlled
+variable. Note the cap is a cap: if the model stops early at one depth and not
+another, reply length has varied too, and `depth` says so when it happens.
 
 Filler is sized by the server's own tokenizer, and varies as it goes. Repeating
-one paragraph inflates speculative-draft acceptance, and acceptance is most of
-what throughput is on a speculative setup -- so lazy filler quietly
+one paragraph inflates speculative-draft acceptance, and acceptance strongly
+affects throughput on a speculative setup -- so lazy filler quietly
 manufactures the result.
 """
 import argparse
 import csv
+import hashlib
 import json
+import ntpath
 import math
 import os
 import shutil
@@ -37,11 +41,15 @@ import statistics as st
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 
+VERSION = "0.1.0"
+
 COLUMNS = [
-    "ts", "label", "pass", "suite", "effort", "depth_target", "max_tokens",
+    "ts", "version", "run_id", "label", "pass", "suite", "effort", "depth_target", "max_tokens",
     "ctx_tokens", "prompt_n", "cache_n", "gen_tok", "decode_tps", "prefill_tps",
     "draft_n", "draft_acc", "accept_pct", "reason_chars", "content_chars",
     "answered", "finish", "wall_s", "power_w", "temp_c", "clock_mhz",
@@ -49,8 +57,8 @@ COLUMNS = [
 ]
 
 # Two workloads that sit at opposite ends of how predictable the output is.
-# On a speculative-decoding setup this is the single biggest lever on
-# throughput, and it is the one a benchmark prompt silently chooses for you.
+# On a speculative-decoding setup this can materially change throughput, and it
+# is the variable a benchmark prompt silently chooses for you.
 PROMPTS = {
     "code": ("Write a complete Python implementation of a red-black tree with "
              "insert, delete and search. Include full docstrings and type hints."),
@@ -129,16 +137,23 @@ def not_a_server(url, path, raw):
 
 
 class Server:
-    def __init__(self, url, model, timeout=1800):
+    def __init__(self, url, model, timeout=1800, sampling=None):
         self.url = url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        # Greedy by default so repeats are comparable, but overridable: a model
+        # whose published preset differs between thinking and non-thinking
+        # modes cannot be benchmarked honestly on one fixed setting.
+        self.sampling = sampling or {"temperature": 0}
 
-    def post(self, path, payload, timeout=None):
-        req = urllib.request.Request(
-            self.url + path, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+    def _fetch(self, req, path, timeout):
+        """One place where a response becomes JSON, so GET and POST agree.
+
+        Keep it that way: a second copy is a second chance to lose the "this is
+        not a llama.cpp server" diagnosis, which is the message here most worth
+        having.
+        """
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             # Capped: an endpoint that streams forever would otherwise take the
             # client's memory with it, and --url can point anywhere.
             raw = r.read(MAX_RESPONSE_BYTES + 1)
@@ -153,6 +168,15 @@ class Server:
             # llama.cpp server. Say that, rather than printing the HTML.
             raise BenchError(not_a_server(self.url, path, raw))
 
+    def post(self, path, payload, timeout=None):
+        req = urllib.request.Request(
+            self.url + path, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        return self._fetch(req, path, timeout or self.timeout)
+
+    def get(self, path, timeout=20):
+        return self._fetch(urllib.request.Request(self.url + path), path, timeout)
+
     def ntokens(self, text):
         """Token count from the server, never an estimate.
 
@@ -164,7 +188,8 @@ class Server:
     def chat(self, prompt, max_tokens, effort=None, thinking=None):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": prompt}],
-                   "max_tokens": max_tokens, "temperature": 0, "stream": False}
+                   "max_tokens": max_tokens, "stream": False}
+        payload.update(self.sampling)
         if effort:
             payload["reasoning_effort"] = effort
         if thinking is not None:
@@ -172,13 +197,173 @@ class Server:
             # chat_template_kwargs. Sent at the top level it is accepted and
             # ignored, which looks exactly like the model refusing to comply.
             payload["chat_template_kwargs"] = {"enable_thinking": thinking}
-        t0 = time.time()
+        t0 = time.perf_counter()
         resp = self.post("/v1/chat/completions", payload)
-        return resp, time.time() - t0
+        return resp, time.perf_counter() - t0
+
+
+def safe_url(url):
+    """A server address fit to appear in a file meant to be shared.
+
+    Credentials first: the tool cannot send an auth header, so an operator
+    whose server wants one has only http://user:token@host left, and that
+    would otherwise land in the manifest in clear. Then the host itself, which
+    is a live machine on someone's network rather than a property of the
+    software -- scheme and port are what make a result interpretable, the
+    hostname is not.
+    """
+    # urlsplit is lazy: it accepts a junk port and only raises when .port is
+    # read, so both have to sit inside the guard. This runs before any request
+    # is made, and an unhandled error here would abort the run.
+    try:
+        u = urllib.parse.urlsplit(url)
+        host = (u.hostname or "").lower()
+        port = u.port
+        scheme = u.scheme
+    except ValueError:
+        return "unparseable"
+    if not host:
+        return "unparseable"
+    if host in ("localhost", "127.0.0.1", "::1"):
+        # Brackets are stripped by urlsplit and have to go back, or an IPv6
+        # loopback address comes out unparseable.
+        shown = f"[{host}]" if ":" in host else host
+    else:
+        shown = "<host>"
+    return f"{scheme}://{shown}" + (f":{port}" if port else "")
+
+
+def new_run_id():
+    """Ties every row to the manifest describing the run that produced it.
+
+    Without it the documented compare-two-arms workflow writes both arms to one
+    CSV and overwrites the manifest, leaving rows from two server
+    configurations described by whichever ran last.
+    """
+    return (time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + "-" +
+            uuid.uuid4().hex[:4])
+
+
+def sampling_from(a):
+    """Only what the user actually set, so the manifest records real choices."""
+    out = {"temperature": a.temperature}
+    for flag, key in (("top_p", "top_p"), ("top_k", "top_k"),
+                      ("presence_penalty", "presence_penalty")):
+        v = getattr(a, flag, None)
+        if v is not None:
+            out[key] = v
+    return out
+
+
+def manifest(a, srv, run_id):
+    """What this run was measured on.
+
+    The argument of the write-up behind this tool is that an unlabelled tok/s
+    figure describes nobody's machine. A results file that cannot answer "what
+    produced this" has the same problem, so every run writes one of these
+    beside the CSV.
+    """
+    m = {"ctxbench_version": VERSION,
+         "run_id": run_id,
+         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+         "command": a.cmd,
+         "label": a.label,
+         "url": safe_url(a.url),
+         "model": a.model,
+         "passes": a.passes,
+         "max_tokens": getattr(a, "max_tokens", None),
+         "sampling": sampling_from(a)}
+    for k in ("depths", "suite", "suites", "effort", "efforts", "depth", "lengths"):
+        if hasattr(a, k):
+            m[k] = getattr(a, k)
+    # Ask the server what it is rather than trusting the alias on the command
+    # line, which is whatever the operator typed. /props is a GET.
+    try:
+        props = srv.get("/props")
+        if isinstance(props, dict):
+            # Only the filename. The full model_path is an absolute path on
+            # the operator's machine, and this file is meant to be shared
+            # alongside results.
+            mp = props.get("model_path")
+            if isinstance(mp, str):
+                m["server_model_file"] = ntpath.basename(mp)
+            for k in ("build_info", "total_slots", "n_ctx"):
+                if props.get(k) is not None:
+                    m["server_" + k] = props[k]
+            tmpl = props.get("chat_template")
+            if isinstance(tmpl, str):
+                # The template decides what reasoning_effort means, so its
+                # identity matters; its 10 KB of Jinja does not.
+                m["server_chat_template_sha256"] = hashlib.sha256(
+                    tmpl.encode()).hexdigest()[:16]
+    except BenchError as e:
+        # A URL that is not a llama.cpp server at all is worth saying out loud,
+        # rather than recording it as though the server merely lacks /props.
+        m["server_props"] = f"error: {str(e).replace(srv.url, safe_url(srv.url))}"
+    except Exception:
+        m["server_props"] = "unavailable"
+    try:
+        exe = safe_nvidia_smi()
+        if exe:
+            r = subprocess.run(
+                [exe, "--query-gpu=name,driver_version,memory.total",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10)
+            lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+            if lines:
+                m["gpus"] = lines
+    except Exception:
+        pass
+    return m
+
+
+def start_run(a, srv):
+    """Everything a command does before its first measurement.
+
+    Extracted because all three commands did it identically, and a fourth that
+    forgot a line would ship rows with no manifest describing them -- which is
+    the failure the run id exists to prevent.
+    """
+    run_id = new_run_id()
+    # Writer first: it creates the output directory, and it refuses a CSV whose
+    # columns do not match. Both should happen before a manifest exists, so a
+    # rejected run does not leave one describing rows that were never written.
+    out = Writer(a.out)
+    write_manifest(a, srv, run_id)
+    return run_id, out
+
+
+def write_manifest(a, srv, run_id):
+    # Keyed by run id, not by the CSV name: several arms routinely share one
+    # CSV, and each needs its own record of what it ran against.
+    path = f"{os.path.splitext(a.out)[0]}.{run_id}.manifest.json"
+    with open(path, "w") as fh:
+        json.dump(manifest(a, srv, run_id), fh, indent=2, default=str)
+    print(f"  manifest -> {path}", flush=True)
+
+
+def safe_nvidia_smi():
+    """nvidia-smi, unless it resolved into the working directory.
+
+    Windows searches the working directory before PATH, so a stray
+    nvidia-smi.exe in a downloads folder would run instead. Defined once
+    because a second copy of a security check is a second thing to remember to
+    harden.
+    """
+    exe = shutil.which("nvidia-smi")
+    if not exe or os.path.dirname(os.path.abspath(exe)) == os.getcwd():
+        return None
+    return exe
 
 
 def gpu():
-    """Best-effort telemetry. Absent on non-NVIDIA hosts, and that is fine.
+    """A snapshot taken just after the request returns, not during it.
+
+    These columns are not an average over the generation: on a short request
+    utilisation has often already collapsed by the time this samples. Treat
+    them as "what the card looked like around then", not as workload telemetry.
+
+    Absent on non-NVIDIA hosts, and that is fine.
 
     The working-directory check below is load-bearing, not a stray tidy-up:
     it is what makes this safe to call from a directory someone else can
@@ -187,16 +372,19 @@ def gpu():
     try:
         q = ("--query-gpu=power.draw,temperature.gpu,clocks.sm,"
              "utilization.gpu,memory.used")
-        # shutil.which does NOT exclude the working directory on Windows: it
-        # puts curdir first, unconditionally before 3.12 and by default after.
-        # So resolving is not enough, and a resolution that landed in the
-        # directory the tool was run from is refused rather than executed.
-        exe = shutil.which("nvidia-smi")
-        if not exe or os.path.dirname(os.path.abspath(exe)) == os.getcwd():
+        exe = safe_nvidia_smi()
+        if not exe:
             return [""] * 5
         r = subprocess.run([exe, q, "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=10)
-        return [x.strip() for x in r.stdout.strip().split(",")]
+        # One row per GPU. On a multi-card host, splitting all of stdout on
+        # commas yields a multiple of five fields and the caller's unpack
+        # raises -- so return blanks rather than a row that cannot be read.
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        if len(lines) != 1:
+            return [""] * 5
+        vals = [x.strip() for x in lines[0].split(",")]
+        return vals if len(vals) == 5 else [""] * 5
     except Exception:
         return [""] * 5
 
@@ -220,7 +408,13 @@ def block(i):
 
 
 def build_prompt(srv, depth, ask, chunk=200):
-    """Filler grown coarsely then trimmed, so this costs a few tokenize calls."""
+    """Filler grown coarsely then trimmed, so this costs a few tokenize calls.
+
+    `depth` sizes the filler alone. The task prompt and the chat template's own
+    overhead sit on top of it, so the context the server actually sees is a
+    little larger -- that number is recorded per row as `ctx_tokens`, and is
+    the one to read when interpreting results.
+    """
     if depth == 0:
         return ask
     # A small target can be overshot by a whole chunk before the first check,
@@ -313,7 +507,15 @@ def measure(srv, prompt, max_tokens, effort=None, thinking=None):
 
 class Writer:
     def __init__(self, path):
-        new = not os.path.exists(path)
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        if not new:
+            with open(path, newline="") as fh:
+                header = next(csv.reader(fh), [])
+            if header != COLUMNS:
+                raise BenchError(
+                    f"{path} was written with a different column set, probably "
+                    f"by another version of this tool. Appending would leave "
+                    f"two schemas in one file. Use a new --out.")
         d = os.path.dirname(os.path.abspath(path))
         if d:
             os.makedirs(d, exist_ok=True)
@@ -330,7 +532,7 @@ class Writer:
         if unknown:
             raise BenchError(f"columns missing from COLUMNS: {sorted(unknown)}")
         base = {c: "" for c in COLUMNS}
-        base.update(ts=int(time.time()), **kw)
+        base.update(ts=int(time.time()), version=VERSION, **kw)
         self.w.writerow({k: safe_cell(v) for k, v in base.items()})
         self.fh.flush()
 
@@ -350,7 +552,7 @@ def show(r, prefix):
 
 
 def cmd_depth(a):
-    srv = Server(a.url, a.model)
+    srv = Server(a.url, a.model, sampling=sampling_from(a))
     depths = [int(d) for d in a.depths.split(",")]
     ask = PROMPTS.get(a.suite, a.suite)
 
@@ -361,7 +563,7 @@ def cmd_depth(a):
         print(f"    depth {d:>7,} -> {srv.ntokens(prompts[d]):>7,} actual tokens",
               flush=True)
 
-    out = Writer(a.out)
+    run_id, out = start_run(a, srv)
     try:
         for p in range(a.passes):
             # Rotate, do not just reverse: with more than two depths a straight
@@ -369,7 +571,19 @@ def cmd_depth(a):
             order = depths[p % len(depths):] + depths[:p % len(depths)]
             for d in order:
                 r = measure(srv, prompts[d], a.max_tokens, a.effort or None)
-                out.row(label=a.label, **{"pass": p + 1}, suite=a.suite,
+                if r["gen_tok"] != a.max_tokens:
+                    # The cap is the only thing holding reply length still. A
+                    # model that stops early at one depth and not another has
+                    # varied two things at once, and reply length moves tok/s
+                    # on its own -- which is what `ab` exists to measure.
+                    # Said mid-run, before the other depths exist, so it
+                    # cannot yet claim the rows disagree with each other.
+                    print(f"    warning: depth {d:,} stopped at "
+                          f"{r['gen_tok']} tokens rather than the "
+                          f"{a.max_tokens} requested; check gen_tok is "
+                          f"comparable across depths before reading these "
+                          f"rates", file=sys.stderr, flush=True)
+                out.row(run_id=run_id, label=a.label, **{"pass": p + 1}, suite=a.suite,
                         effort=a.effort, depth_target=d,
                         max_tokens=a.max_tokens, **r)
                 show(r, f"p{p+1} d={d:>7,}")
@@ -384,7 +598,7 @@ def cmd_grid(a):
     spend the whole budget thinking, so you measure the decode rate of
     deliberation and call it generation.
     """
-    srv = Server(a.url, a.model)
+    srv = Server(a.url, a.model, sampling=sampling_from(a))
     suites = a.suites.split(",")
     efforts = a.efforts.split(",")
     cells = [(s, e) for e in efforts for s in suites]
@@ -392,7 +606,7 @@ def cmd_grid(a):
     # rebuilding costs a round of tokenize calls for an identical string.
     prompts = {s: build_prompt(srv, a.depth, PROMPTS.get(s, s)) for s in suites}
 
-    out = Writer(a.out)
+    run_id, out = start_run(a, srv)
     try:
         for p in range(a.passes):
             order = cells if p % 2 == 0 else cells[::-1]
@@ -402,7 +616,7 @@ def cmd_grid(a):
                 thinking = False if effort == "off" else None
                 r = measure(srv, prompts[suite], a.max_tokens,
                             None if effort == "off" else effort, thinking)
-                out.row(label=a.label, **{"pass": p + 1}, suite=suite,
+                out.row(run_id=run_id, label=a.label, **{"pass": p + 1}, suite=suite,
                         effort=effort, depth_target=a.depth,
                         max_tokens=a.max_tokens, **r)
                 show(r, f"p{p+1} {suite:<5} {effort:<7}")
@@ -416,20 +630,20 @@ def cmd_ab(a):
     Kept separate on purpose. Reporting the spread between the fastest and
     slowest cell as one effect attributes to content what reply length did.
     """
-    srv = Server(a.url, a.model)
+    srv = Server(a.url, a.model, sampling=sampling_from(a))
     lengths = [int(x) for x in a.lengths.split(",")]
     suites = a.suites.split(",")
     cells = ([(s, lengths[0]) for s in suites] +
              [(suites[0], n) for n in lengths[1:]])
     prompts = {s: build_prompt(srv, a.depth, PROMPTS.get(s, s)) for s in suites}
 
-    out = Writer(a.out)
+    run_id, out = start_run(a, srv)
     try:
         for p in range(a.passes):
             order = cells if p % 2 == 0 else cells[::-1]
             for suite, n in order:
                 r = measure(srv, prompts[suite], n, a.effort or None)
-                out.row(label=a.label, **{"pass": p + 1}, suite=suite,
+                out.row(run_id=run_id, label=a.label, **{"pass": p + 1}, suite=suite,
                         effort=a.effort, depth_target=a.depth,
                         max_tokens=n, **r)
                 show(r, f"p{p+1} {suite:<5} {n:>5} tok")
@@ -466,7 +680,7 @@ def agg(rows):
         # None, not 0.0. A single sample has no spread, and calling that zero
         # collapses the noise floor so that any difference at all reads as
         # real -- in the same confident format as a properly replicated one.
-        "sd": st.pstdev(t) if len(t) > 1 else None,
+        "sd": st.stdev(t) if len(t) > 1 else None,
         "acc": st.mean(acc) if acc else None,
         "answered": sum(r["answered"] for r in rows),
         "wall": st.mean([r["wall_s"] for r in rows]),
@@ -495,19 +709,29 @@ def cmd_report(a):
         cells = sorted({(r["suite"], r["effort"], r["max_tokens"]) for r in rs})
 
         if len(depths) > 1:
-            print(f"  {'depth':>9}{'tok/s':>10}{'sd':>7}{'accept':>9}{'vs depth 0':>12}")
-            base = None
-            for d in depths:
-                g = agg([r for r in rs if r["depth_target"] == d])
-                base = base or g["tps"]
-                acc = f"{g['acc']:.1f}%" if g["acc"] is not None else "n/a"
-                sd = f"{g['sd']:.2f}" if g["sd"] is not None else "-"
-                print(f"  {d:>9,}{g['tps']:>10.2f}{sd:>7}{acc:>9}"
-                      f"{100 * (g['tps'] / base - 1):>11.1f}%")
+            if len(cells) > 1:
+                print(f"  label '{label}' holds more than one kind of run "
+                      f"({len(cells)} suite/effort/max-token combinations), so "
+                      f"a depth table would average them together. Use a "
+                      f"separate --label per experiment.")
+            else:
+                # Percentages are against the shallowest row present, which is
+                # not always 0 once --depths is customised.
+                base_depth = depths[0]
+                print(f"  {'depth':>9}{'tok/s':>10}{'sd':>7}{'accept':>9}"
+                      f"{('vs ' + format(base_depth, ',')):>14}")
+                base = None
+                for d in depths:
+                    g = agg([r for r in rs if r["depth_target"] == d])
+                    base = base or g["tps"]
+                    acc = f"{g['acc']:.1f}%" if g["acc"] is not None else "n/a"
+                    sd = f"{g['sd']:.2f}" if g["sd"] is not None else "-"
+                    print(f"  {d:>9,}{g['tps']:>10.2f}{sd:>7}{acc:>9}"
+                          f"{100 * (g['tps'] / base - 1):>13.1f}%")
 
         if len(cells) > 1:
             print(f"  {'suite':<8}{'effort':<9}{'maxtok':>8}{'tok/s':>10}"
-                  f"{'sd':>7}{'accept':>9}{'finished':>10}{'wall':>8}")
+                  f"{'sd':>7}{'accept':>9}{'answered':>10}{'wall':>8}")
             for suite, effort, mt in cells:
                 g = agg([r for r in rs if (r["suite"], r["effort"],
                                            r["max_tokens"]) == (suite, effort, mt)])
@@ -559,6 +783,8 @@ def cmd_report(a):
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"ctx-bench {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
@@ -566,6 +792,14 @@ def main():
                                                        "http://127.0.0.1:8080"))
         p.add_argument("--model", default=os.environ.get("CTXBENCH_MODEL", "default"))
         p.add_argument("--out", default="results.csv")
+        # Greedy by default so repeats are comparable. Overridable because a
+        # model's published preset is part of the operating point, and some
+        # publish different ones for thinking and non-thinking modes.
+        p.add_argument("--temperature", type=float, default=0.0)
+        p.add_argument("--top-p", type=float, default=None, dest="top_p")
+        p.add_argument("--top-k", type=int, default=None, dest="top_k")
+        p.add_argument("--presence-penalty", type=float, default=None,
+                       dest="presence_penalty")
         p.add_argument("--label", default="run",
                        help="names this arm in the CSV; compare two arms by "
                             "running twice with different labels")
